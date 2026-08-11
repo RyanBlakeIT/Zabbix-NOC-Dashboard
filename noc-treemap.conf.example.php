@@ -51,8 +51,15 @@ return [
     'graph_units'     => 'Mbit/s',
     'graph_ceiling'   => 0,        // 0 = auto-round per site; or fix e.g. 1000
     'graph_colors'    => ['#7EB6FF', '#FFC859', '#59DB8F', '#E97659'],
-    'graph_h'         => 6.5,      // band height, % of page (0 disables)
-    'graph_max_share' => 0.34,
+    // 'chart' draws axes, gridlines, time labels and annotated min/max.
+    // 'spark' is the bare area+line. chart falls back to spark automatically
+    // when a band is too short to letter (see graph_axes_min_h).
+    'graph_style'     => 'chart',
+    'graph_axes_min_h'=> 46,       // px; below this a chart renders as a spark
+    // Buckets to carry the last value across before treating a gap as real.
+    'graph_fill_gaps' => 3,
+    'graph_h'         => 10.0,     // band height, % of page (0 disables)
+    'graph_max_share' => 0.40,
     'graph_hide_below'=> 8.0,
     'history_limit'   => 20000,
 

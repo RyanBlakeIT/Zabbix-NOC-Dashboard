@@ -107,6 +107,14 @@ items, prefers ports whose description matches `seed_prefer`, and falls back to
 ranking by recent traffic. The result lands in `uplinks_file` as plain JSON that
 you can hand-edit — the page only ever reads it.
 
+Graphs render in one of two styles, set by `graph_style`:
+
+- `chart` — axes, gridlines, time labels, and annotated min/max
+- `spark` — a bare area-and-line, for bands too short to letter
+
+`chart` falls back to `spark` on its own when a band is shorter than
+`graph_axes_min_h` pixels, so small sites stay readable without extra config.
+
 ## Display names
 
 Optional. `labels_file` lets you rename sites, closets, and hosts for the wall
@@ -134,7 +142,8 @@ knowing:
 | Key | What it does |
 | --- | --- |
 | `exponent` | Site area weighting. `1.0` is strict host count; lower values give small sites more room. |
-| `graph_h` | Sparkline band height as a % of page. `0` disables graphs entirely. |
+| `graph_h` | Graph band height as a % of page. `0` disables graphs entirely. |
+| `graph_fill_gaps` | Buckets to carry the last value across before a gap counts as a real outage. Prevents a summed total from sawtoothing when in/out samples land in different buckets. |
 | `hide_label_below` | Tiles smaller than this (% of page) render unlabeled. |
 | `font_uniform` | `closet` sizes all tiles in a closet alike; `tile` sizes each independently. |
 | `cache_ttl` | Seconds. Keeps a wall of screens from hammering the API. |

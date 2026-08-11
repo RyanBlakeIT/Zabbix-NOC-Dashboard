@@ -125,6 +125,9 @@ foreach ($plan as [$code, $display, $closets]) {
         $series[] = round($prev, 2);
     }
 
+    $window = (int)($cfg['graph_window'] ?? 7200);
+    $t0     = time() - $window;
+
     $sites[$code] = [
         'closets' => $list,
         'count'   => array_sum(array_map(fn($c) => count($c['hosts']), $list)),
@@ -134,6 +137,8 @@ foreach ($plan as [$code, $display, $closets]) {
             'max'    => max($series),
             'min'    => min($series),
             'last'   => end($series),
+            't0'     => $t0,          // chart mode labels the time axis from these
+            't1'     => $t0 + $window,
             'host'   => "$code-SW01",
             'label'  => 'MetroE',
         ]],

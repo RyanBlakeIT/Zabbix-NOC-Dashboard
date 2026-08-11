@@ -1,6 +1,6 @@
 <?php
 /**
- * noc-treemap.php -- live division-wide treemap for a NOC display.
+ * noc-treemap.php -- live estate-wide treemap for a NOC display.
  *
  * Renders every site as a packed block, each closet as a sub-block, and each
  * host as a tile colored by its worst active problem. Uplink sparklines come
@@ -498,6 +498,68 @@ function bucketize(array $points, int $t0, int $window, int $n): array
     return $out;
 }
 
+/**
+ * Carry the last known value forward across short gaps.
+ *
+ * Without this, "received" and "sent" samples that land in different time
+ * buckets never appear together, so a summed total alternates between one
+ * direction and the other -- which renders as a sawtooth rather than traffic.
+ * Runs longer than $maxRun are left as real gaps so an outage still shows.
+ */
+function fill_gaps(array $buckets, int $maxRun): array
+{
+    if ($maxRun <= 0) {
+        return $buckets;
+    }
+    $out = $buckets;
+    $last = null;
+    $run = 0;
+    foreach ($buckets as $i => $v) {
+        if ($v !== null) {
+            $last = $v;
+            $run = 0;
+            continue;
+        }
+        if ($last === null) {
+            continue;
+        }
+        if ($run < $maxRun) {
+            $out[$i] = $last;
+            $run++;
+        } else {
+            $last = null;
+        }
+    }
+    return $out;
+}
+
+
+/** Typical seconds between samples, taken from the slowest item. */
+function estimate_step(array $raw): int
+{
+    $slowest = 0;
+    foreach ($raw as $points) {
+        if (count($points) < 3) {
+            continue;
+        }
+        $deltas = [];
+        for ($i = 1; $i < count($points); $i++) {
+            $d = $points[$i][0] - $points[$i - 1][0];
+            if ($d > 0) {
+                $deltas[] = $d;
+            }
+        }
+        if (!$deltas) {
+            continue;
+        }
+        sort($deltas);
+        $median = $deltas[intdiv(count($deltas), 2)];
+        $slowest = max($slowest, $median);
+    }
+    return $slowest > 0 ? $slowest : 60;
+}
+
+
 function history_for(array $cfg, array $ids_by_type, int $from): array
 {
     $series = [];
@@ -580,29 +642,49 @@ function attach_graphs(array $cfg, array &$sites, array $uplinks): void
                 continue;
             }
 
+            // Bucket width must be at least the poll interval, or samples
+            // from different items fall into separate buckets and never
+            // combine. graph_buckets = 0 derives it from the data.
+            $n = $buckets;
+            $step = estimate_step($raw);
+            if ($n <= 0) {
+                $n = max(20, min(240, (int)floor($window / max($step, 30))));
+            } elseif ($window / $n < $step) {
+                $n = max(20, (int)floor($window / $step));
+            }
+
             $series = [];
             foreach ($chosen as $it) {
                 if (!empty($raw[$it['itemid']])) {
                     $series[] = [$it['name'],
-                                 bucketize($raw[$it['itemid']], $t0, $window, $buckets)];
+                                 bucketize($raw[$it['itemid']], $t0, $window, $n)];
                 }
             }
             if (!$series) {
                 continue;
             }
 
+            $maxRun = (int)cfg($cfg, 'graph_fill_gaps', 3);
+            $filled = [];
+            foreach ($series as [$name, $b]) {
+                $filled[] = [$name, fill_gaps($b, $maxRun)];
+            }
+            $series = $filled;
+
             if (cfg($cfg, 'graph_mode', 'total') === 'total') {
                 $combined = [];
-                for ($i = 0; $i < $buckets; $i++) {
+                for ($i = 0; $i < $n; $i++) {
                     $vals = [];
-                    foreach ($series as [$n, $b]) {
+                    foreach ($series as [$sn, $b]) {
                         if ($b[$i] !== null) {
                             $vals[] = $b[$i];
                         }
                     }
-                    $combined[] = $vals ? array_sum($vals) : null;
+                    // Only total a bucket where every direction is present,
+                    // otherwise a half-filled bucket reads as a dropout.
+                    $combined[] = count($vals) === count($series) ? array_sum($vals) : null;
                 }
-                $plotted = [['Traffic Total', $combined]];
+                $plotted = [['Traffic Total', fill_gaps($combined, $maxRun)]];
             } else {
                 $plotted = $series;
             }
@@ -637,6 +719,8 @@ function attach_graphs(array $cfg, array &$sites, array $uplinks): void
                 'max'    => max($all) / $div,
                 'min'    => min($all) / $div,
                 'last'   => $last / $div,
+                't0'     => $t0,
+                't1'     => $t0 + $window,
                 'host'   => $entry['host'] ?? '',
                 'label'  => $entry['label'] ?? short_iface((string)($entry['interface'] ?? '')),
             ];
@@ -744,18 +828,80 @@ function tile_color(array $host, array $cfg): string
     return $host['severity'] < 0 ? OK_COLOR : SEVERITY[$host['severity']][1];
 }
 
-function sparkline_svg(array $graph, array $cfg): array
+/**
+ * Draw the traffic graph. Two styles:
+ *   'chart' - axes, gridlines, time labels, annotated min/max (needs height)
+ *   'spark' - bare area+line, for bands too short to letter
+ * Falls back to 'spark' automatically when the box is too small.
+ *
+ * The viewBox is sized to the box's REAL pixel dimensions so that
+ * preserveAspectRatio="none" maps 1:1 and text is not stretched.
+ */
+function graph_svg(array $graph, array $cfg, float $wPct, float $hPct): array
 {
-    $W = 1000.0;
-    $H = 300.0;
+    $W = max(60.0, $wPct / 100 * (float)cfg($cfg, 'fit_width', 1920));
+    $H = max(20.0, $hPct / 100 * (float)cfg($cfg, 'fit_height', 1080));
+
     $ceiling = (float)cfg($cfg, 'graph_ceiling', 0);
     if ($ceiling <= 0) {
         $ceiling = nice_ceiling((float)$graph['max']);
     }
+
+    $axes = cfg($cfg, 'graph_style', 'chart') === 'chart'
+         && $H >= (float)cfg($cfg, 'graph_axes_min_h', 46)
+         && $W >= 180;
+
+    $fs = max(7.0, min(12.0, $H * 0.145));
+    $ml = $axes ? $fs * 3.2 : 0.0;   // room for "1,000"
+    $mb = $axes ? $fs * 1.9 : 0.0;   // room for "12:05 PM"
+    $mt = $axes ? $fs * 1.1 : 0.0;
+    $mr = $axes ? $fs * 0.8 : 0.0;
+    $px = $ml;
+    $py = $mt;
+    $pw = max(10.0, $W - $ml - $mr);
+    $ph = max(8.0, $H - $mt - $mb);
+
+    $svg = sprintf('<svg class="spark" viewBox="0 0 %.1f %.1f" preserveAspectRatio="none">',
+                   $W, $H);
+
+    $yOf = fn(float $v) => $py + $ph - min($v / $ceiling, 1.0) * $ph;
+
+    if ($axes) {
+        $steps = $ph > 78 ? 4 : 2;
+        for ($i = 0; $i <= $steps; $i++) {
+            $value = $ceiling * $i / $steps;
+            $y = $yOf($value);
+            $svg .= sprintf('<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" class="gridline"/>',
+                            $px, $y, $px + $pw, $y);
+            $svg .= sprintf('<text x="%.1f" y="%.1f" class="axis" text-anchor="end" '
+                          . 'font-size="%.1f">%s</text>',
+                            $px - $fs * 0.4, $y + $fs * 0.35, $fs,
+                            number_format($value, 0));
+        }
+        $t0 = (int)($graph['t0'] ?? 0);
+        $t1 = (int)($graph['t1'] ?? 0);
+        if ($t1 > $t0) {
+            $marks = $pw > 460 ? 5 : ($pw > 260 ? 4 : 3);
+            for ($i = 0; $i < $marks; $i++) {
+                $frac = $i / ($marks - 1);
+                $x = $px + $frac * $pw;
+                $svg .= sprintf('<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" '
+                              . 'class="gridline vert"/>', $x, $py, $x, $py + $ph);
+                $anchor = $i === 0 ? 'start' : ($i === $marks - 1 ? 'end' : 'middle');
+                $svg .= sprintf('<text x="%.1f" y="%.1f" class="axis" text-anchor="%s" '
+                              . 'font-size="%.1f">%s</text>',
+                                $x, $py + $ph + $fs * 1.45, $anchor, $fs,
+                                date('g:i A', (int)round($t0 + $frac * ($t1 - $t0))));
+            }
+        }
+        $svg .= sprintf('<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" class="axisline"/>',
+                        $px, $py, $px, $py + $ph);
+        $svg .= sprintf('<line x1="%.1f" y1="%.1f" x2="%.1f" y2="%.1f" class="axisline"/>',
+                        $px, $py + $ph, $px + $pw, $py + $ph);
+    }
+
     $colors = (array)cfg($cfg, 'graph_colors', ['#7EB6FF']);
-    $out = sprintf('<svg class="spark" viewBox="0 0 %d %d" preserveAspectRatio="none">', $W, $H);
-    $out .= sprintf('<line x1="0" y1="%.1f" x2="%d" y2="%.1f" class="gridline"/>',
-                    $H * 0.5, $W, $H * 0.5);
+    $primary = null;
     foreach ($graph['series'] as $idx => [$name, $buckets]) {
         $n = count($buckets);
         $pts = [];
@@ -763,24 +909,63 @@ function sparkline_svg(array $graph, array $cfg): array
             if ($value === null) {
                 continue;
             }
-            $x = ($i / max($n - 1, 1)) * $W;
-            $y = $H - min($value / $ceiling, 1.0) * $H;
-            $pts[] = sprintf('%.1f,%.1f', $x, $y);
+            $x = $px + ($i / max($n - 1, 1)) * $pw;
+            $pts[] = [$x, $yOf($value), $value];
         }
         if (count($pts) < 2) {
             continue;
         }
+        if ($primary === null) {
+            $primary = $pts;
+        }
         $color = $colors[$idx % count($colors)];
-        $line = implode(' ', $pts);
-        $first = explode(',', $pts[0])[0];
-        $lastX = explode(',', $pts[count($pts) - 1])[0];
-        $out .= sprintf('<polygon points="%s,%.1f %s %s,%.1f" fill="%s" opacity=".30"/>',
-                        $first, $H, $line, $lastX, $H, $color);
-        $out .= sprintf('<polyline points="%s" fill="none" stroke="%s" stroke-width="4" '
-                        . 'vector-effect="non-scaling-stroke"/>', $line, $color);
+        $line = '';
+        foreach ($pts as $p) {
+            $line .= sprintf('%.1f,%.1f ', $p[0], $p[1]);
+        }
+        $line = trim($line);
+        $svg .= sprintf('<polygon points="%.1f,%.1f %s %.1f,%.1f" fill="%s" opacity=".28"/>',
+                        $pts[0][0], $py + $ph, $line,
+                        $pts[count($pts) - 1][0], $py + $ph, $color);
+        $svg .= sprintf('<polyline points="%s" fill="none" stroke="%s" stroke-width="%.1f" '
+                      . 'stroke-linejoin="round"/>', $line, $color, $axes ? 1.6 : 2.2);
     }
-    return [$out . '</svg>', $ceiling];
+
+    // Annotate the high and low points of the first series, PRTG-style.
+    if ($axes && $primary) {
+        $hi = $lo = $primary[0];
+        foreach ($primary as $p) {
+            if ($p[2] > $hi[2]) {
+                $hi = $p;
+            }
+            if ($p[2] < $lo[2]) {
+                $lo = $p;
+            }
+        }
+        foreach ([['Max', $hi, -1], ['Min', $lo, 1]] as [$tag, $p, $dir]) {
+            $svg .= sprintf('<circle cx="%.1f" cy="%.1f" r="%.1f" class="marker"/>',
+                            $p[0], $p[1], max(2.0, $fs * 0.26));
+            $ty = $p[1] + $dir * $fs * 1.25;
+            $ty = max($py + $fs, min($py + $ph - $fs * 0.2, $ty));
+            $anchor = 'middle';
+            $tx = $p[0];
+            if ($tx < $px + $pw * 0.16) {
+                $anchor = 'start';
+                $tx = $px + 2;
+            } elseif ($tx > $px + $pw * 0.84) {
+                $anchor = 'end';
+                $tx = $px + $pw - 2;
+            }
+            $svg .= sprintf('<text x="%.1f" y="%.1f" class="mark" text-anchor="%s" '
+                          . 'font-size="%.1f">%s: %s %s</text>',
+                            $tx, $ty, $anchor, $fs, $tag, fmt_rate($p[2]),
+                            e((string)cfg($cfg, 'graph_units', '')));
+        }
+    }
+
+    return [$svg . '</svg>', $ceiling, $axes];
 }
+
 
 function render(array $sites, array $cfg, string $baseUrl): string
 {
@@ -838,23 +1023,33 @@ function render(array $sites, array $cfg, string $baseUrl): string
                 $gx = $sx + $gap;
                 $gw = max(0.0, $sw - 2 * $gap);
                 foreach ($graphs as $gi => $graph) {
-                    [$svg, $ceiling] = sparkline_svg($graph, $cfg);
+                    [$svg, $ceiling, $hasAxes] = graph_svg($graph, $cfg, $gw, $rowH);
                     $gy = $sy + $hdr + $gi * $rowH;
                     $name = (string)($graph['label'] ?? '');
                     $nameChip = $name === '' ? '' : sprintf(
                         '<span class="g-name" style="font-size:%.3fvw">%s</span>',
                         font_for($gw, $rowH, $cfg, 0.52), e($name));
+                    // With axes drawn the ceiling and min/max are already on
+                    // the chart; only the current value is still worth a chip.
+                    $scaleChip = $hasAxes ? '' : sprintf(
+                        '<span class="g-scale" style="font-size:%.3fvw">%s</span>',
+                        font_for($gw, $rowH, $cfg, 0.52), (string)(int)$ceiling);
+                    $statChip = $hasAxes
+                        ? sprintf('<span class="g-stat" style="font-size:%.3fvw">'
+                                . '&#9679;%s %s</span>',
+                                  font_for($gw, $rowH, $cfg, 0.62),
+                                  fmt_rate((float)$graph['last']),
+                                  e((string)cfg($cfg, 'graph_units', '')))
+                        : sprintf('<span class="g-stat" style="font-size:%.3fvw">'
+                                . '&#9650;%s &#9660;%s &#9679;%s %s</span>',
+                                  font_for($gw, $rowH, $cfg, 0.62),
+                                  fmt_rate((float)$graph['max']),
+                                  fmt_rate((float)$graph['min']),
+                                  fmt_rate((float)$graph['last']),
+                                  e((string)cfg($cfg, 'graph_units', '')));
                     $divs[] = sprintf('<div class="graph" style="left:%.4f%%;top:%.4f%%;'
-                        . 'width:%.4f%%;height:%.4f%%">%s'
-                        . '<span class="g-scale" style="font-size:%.3fvw">%s</span>%s'
-                        . '<span class="g-stat" style="font-size:%.3fvw">'
-                        . '&#9650;%s &#9660;%s &#9679;%s %s</span></div>',
-                        $gx, $gy, $gw, $rowH, $svg,
-                        font_for($gw, $rowH, $cfg, 0.52), (string)(int)$ceiling, $nameChip,
-                        font_for($gw, $rowH, $cfg, 0.62),
-                        fmt_rate((float)$graph['max']), fmt_rate((float)$graph['min']),
-                        fmt_rate((float)$graph['last']),
-                        e((string)cfg($cfg, 'graph_units', '')));
+                        . 'width:%.4f%%;height:%.4f%%">%s%s%s%s</div>',
+                        $gx, $gy, $gw, $rowH, $svg, $scaleChip, $nameChip, $statChip);
                 }
             } else {
                 $gband = 0.0;
@@ -1012,7 +1207,13 @@ function page_html(array $v): string
   .graph{position:absolute;background:#18212a;border:1px solid #33414d;border-radius:2px;
     overflow:hidden}
   .graph .spark{position:absolute;inset:0;width:100%;height:100%;display:block}
-  .graph .gridline{stroke:#3a4a57;stroke-width:2;stroke-dasharray:6 6}
+  .graph .gridline{stroke:#3a4a57;stroke-width:1;stroke-dasharray:3 4}
+  .graph .gridline.vert{stroke:#2f3d49}
+  .graph .axisline{stroke:#54687a;stroke-width:1}
+  .graph .axis{fill:#8fa3b0;font-family:inherit}
+  .graph .mark{fill:#dbe6ee;font-family:inherit;font-weight:600;paint-order:stroke;
+    stroke:rgba(20,27,33,.85);stroke-width:2.5}
+  .graph .marker{fill:#dbe6ee;stroke:#141b21;stroke-width:1}
   .graph .g-scale{position:absolute;left:.18vw;top:.08vw;opacity:.55;line-height:1;
     background:rgba(20,27,33,.72);padding:.04vw .14vw;border-radius:2px}
   .graph .g-name{position:absolute;left:50%;top:.08vw;transform:translateX(-50%);
